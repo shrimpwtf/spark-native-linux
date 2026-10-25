@@ -1,0 +1,419 @@
+# Investigation
+
+Debugger evidence behind each fix in this repository. Host identifiers, crash
+dump files and account data are not included. Raw dump text is not published,
+because register and stack contents hold the host name and a LAN address.
+
+Environment: Wine 11.16, 64-bit. Spark Desktop 3.30.10, Electron 42.3.3.
+Arch Linux with Hyprland.
+
+## What did not work
+
+The first theory was a C or C++ runtime mismatch. `SparkCore` ships its own
+Visual C++ runtime DLLs. Three configurations were tested, and all three
+crashed during startup with access violation `0xC0000005`:
+
+1. Native Microsoft UCRT only. The loader confirmed native `ucrtbase.dll`.
+   Mixed-runtime export errors also appeared.
+2. Native UCRT plus native Visual C++ overrides. `SparkCore` loaded its
+   bundled `VCRUNTIME140.dll`. The export errors cleared. The crash stayed.
+3. Bundled Visual C++ DLLs replaced by the current Microsoft v14
+   redistributable. The crash stayed.
+
+Conclusion: the C and C++ runtime is not the cause. Replacing it changes
+nothing. This theory cost the most time and produced no result.
+
+## Fix 1: the startup crash
+
+Crashpad wrote a minidump during startup. The stack, in module-relative
+offsets, ran from a memory copy in `vcruntime140` up through nine `Foundation`
+frames into `RDCalendarsAPI`:
+
+```
+vcruntime140+0x1dc91   (memory copy)
+Foundation+0x32cad5
+Foundation+0x32d0dc
+Foundation+0x3857ed
+Foundation+0x36cf0c
+Foundation+0x36db2d
+Foundation+0x36d714
+Foundation+0x36d744
+Foundation+0x2da612
+RDCalendarsAPI+0x250915
+RDCalendarsAPI+0x24c2a5
+```
+
+The `Foundation` import address table at RVA `0x41d1b8` resolves to
+`USERENV.dll!GetAllUsersProfileDirectoryW`.
+
+At RVA `0x3857a0`, `Foundation` does the following:
+
+1. It initializes a `DWORD` length to zero.
+2. It calls `GetAllUsersProfileDirectoryW` twice.
+3. It ignores both return values.
+4. It loads that length and decrements it as a 32-bit integer, at RVA
+   `0x3857d8`.
+
+Wine 11.16 implements this function as a stub. It returns `FALSE` and never
+writes the size. See
+[`dlls/userenv/userenv_main.c`](https://github.com/wine-mirror/wine/blob/wine-11.16/dlls/userenv/userenv_main.c).
+
+So the length stays zero, and the decrement underflows to `0xffffffff`. At
+`Foundation+0x32d0a4` the code doubles that value for UTF-16 bytes, which gives
+`0x1fffffffe`. The fault registers confirmed it: `R8` and `RBX` both held
+`0x1fffffffe`, that is 8,589,934,590 bytes. The launch log recorded both API
+calls immediately before the exception.
+
+Cause: an unimplemented Wine API, combined with an unchecked failure in Apple's
+`Foundation`.
+
+Fix: `profile-shim.c`, built as `sprkenv.dll`. It returns `C:\ProgramData`, and
+it implements the documented size-query and insufficient-buffer behaviour.
+`GetProfilesDirectoryW` forwards to Wine's own `userenv` through the `.def`
+file, because Wine implements that one correctly.
+
+`patch-foundation.py` rewrites the single `USERENV.dll\0` import name to the
+equal-length `sprkenv.dll\0`. Equal length means the patch needs no relocation
+work. The script asserts that exactly one occurrence exists.
+
+Result: the shim loaded in the main process and in every worker. Spark finished
+bootstrap and stayed running past the previous crash point.
+
+## Fix 2: the crash after login
+
+Onboarding then succeeded, and Spark crashed as soon as the main UI and
+calendar loaded. Crashpad wrote a 612 MB dump. Non-interactive `winedbg`
+showed:
+
+- A `ud2` instruction, the Swift fatal trap, at `Foundation+0xe42d6`, on a
+  `SmartMailCommon` dispatch worker thread.
+- This backtrace: `ProcessInfo.hostName` at `+0x277f04`, then `Host.name`,
+  `Host.names`, `Host._resolve`, and `Host._resolveCurrent(withInfo:)` as the
+  caller at `+0xe4377`.
+- Registers and stack held the host name as ASCII, and a LAN IP address as a
+  string. That is adapter enumeration data.
+- Disassembly of `_resolveCurrent` showed a `testq` and a `je` to `ud2`
+  directly after an indirect call. That is a Swift implicit-unwrap trap.
+
+In swift-corelibs-foundation, the Windows path of `Host._resolveCurrent` walks
+`IP_ADAPTER_ADDRESSES` and force-unwraps `Address.lpSockaddr`. Wine fills those
+structures so that the pointer is empty, or laid out differently, so the unwrap
+traps.
+
+The fallback path was checked before choosing the fix. Disassembly of
+`ProcessInfo.hostName` at `Foundation+0x277f13` shows a nil check that
+substitutes the string `"localhost"` when `Host.name` is nil. Reporting no
+adapters is therefore safe.
+
+Fix: `adapter-shim.c`, built as `sprkiphl.dll`. It exports
+`GetAdaptersAddresses` and returns `ERROR_NO_DATA`, which is 232, for every
+call. `_resolveCurrent` then returns early, `Host.name` is nil, and `hostName`
+becomes `"localhost"`.
+
+`patch-iphlpapi.py` rewrites the single `IPHLPAPI.DLL\0` import name to the
+equal-length `sprkiphl.dll\0`. `Foundation` imports nothing else from that
+library, so redirecting the whole descriptor is safe.
+
+Result: relaunch no longer crashes. Main UI, inbox sync, calendar view and
+sending mail all work.
+
+## Fix 3: the OAuth callback
+
+Spark is an Electron app. At launch it registers its URL schemes in the Wine
+prefix under `HKCU`. Each entry points at `"Spark Desktop.exe" --win-open-url
+"%1"`.
+
+Browser sign-in and deep links need matching host `x-scheme-handler` entries
+for every custom scheme Spark registers. Spark 3.30.12 logged eleven schemes
+covering Google, Microsoft, Yahoo, Stripe, campaign links, and Spark's own deep
+links. The desktop template in `share/` registers the complete observed set,
+`install-handler.sh` makes the hidden handler the default for each
+Spark-specific scheme, and `auth-callback.py` validates the same allowlist
+before it acts.
+
+The important fix was in the launcher, not the handler. The launcher used
+`--tmpfs /tmp`. A callback invocation therefore got a fresh wineserver socket
+directory, could not see the running instance, and booted a second full
+instance over the same prefix. Electron's single-instance forwarding never
+fired.
+
+The launcher now bind-mounts a persistent project-local `tmp/` at `/tmp`. The
+callback joins the running wineserver, and Spark's second-instance handler
+receives the URL in the primary process.
+
+Result: Google consent completed in the host browser, the callback reached
+Spark, and login and onboarding succeeded.
+
+## PowerShell hardware probes
+
+Spark's system-information dependency launches several PowerShell commands for
+disk, display, processor, BIOS, and other diagnostic hardware metadata when a
+PowerShell executable is available. A reused Wine prefix with PowerShell 7
+installed spawned one `pwsh.exe` per probe. Each process failed with exception
+`0xe0434352` and opened a Wine `Program Error` dialog, producing 17 dialogs in
+one observed launch. Spark itself still reached its ready state.
+
+Adding both `powershell.exe` and `pwsh.exe` to the disabled DLL overrides
+prevented the probes from starting. The repeated exceptions and debugger
+windows fell to zero while Spark and SparkCore still reached ready. The
+launcher therefore disables both executable names by default. This removes
+optional hardware metadata; it does not disable a Spark mail feature.
+
+## Tray tile and notifications
+
+Spark registers a tray icon. The log shows `fixme:systray:Shell_NotifyIconGetRect`
+stubs. With no `StatusNotifierWatcher` on the session bus, Wine's
+`explorer.exe` draws the icon as a small floating tile. That window has class
+`explorer.exe` and an empty title. Terminating that helper left Spark's main
+window, renderer, CLI, and notification watcher active. However, that process also owns Wine's clipboard manager.
+The earlier termination removed the bridge between the Windows clipboard and the desktop clipboard.
+[Wine's desktop code](https://github.com/wine-mirror/wine/blob/master/programs/explorer/desktop.c) starts the clipboard thread inside `explorer.exe`.
+
+The launcher now sends `WM_DELETE_WINDOW` only to the tray window owned by the matching explorer process.
+[Wine's tray code](https://github.com/wine-mirror/wine/blob/master/programs/explorer/systray.c) handles `WM_CLOSE` by hiding the tray window.
+The explorer process remains active to manage the clipboard.
+
+On 2026-10-01, host clipboard text matched Wine's clipboard with Spark 3.31.4.141104 focused.
+A native test helper read the clipboard and compared a hash without changing or printing the clipboard content.
+Both message copy actions still need direct UI checks.
+
+## Host browser
+
+Wine's default browser command uses `xdg-open` inside Bubblewrap.
+That command inherits the home overlay, so Chrome uses a separate profile without the host browser's account state.
+The launcher adds `bin/host-tools` to Wine's PATH so Wine finds the local `xdg-open` wrapper first.
+
+The helper calls the desktop portal's [OpenURI method](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.OpenURI.html).
+The portal opens the host browser outside the home overlay.
+The helper waits for the portal response and never logs the URL.
+
+CLI calls skip the wrapper and all desktop helpers.
+On 2026-10-01, the wrapper and portal checks passed inside Bubblewrap while the existing host Chrome process remained active.
+Wine's browser command also passed after removal of the earlier `WineBrowser\Browsers` override.
+
+The initial browser change added a separate `wine reg.exe` command before Spark.
+That command could block startup before the launcher reaches Spark.
+The launcher now starts Spark through one Wine command, as before the browser change.
+
+Browser integration changes only Wine's PATH and does not block startup.
+
+## Spark 3.31.4.141104 update
+
+The official Windows release notes list 3.31.4.141104, released on 2026-09-29.
+The installer manifest matches all 297 extracted files, and both Foundation patches preserve the expected imports.
+The update retains the existing prefix, home overlay, and Wine 11.16 runtime.
+
+On 2026-10-01, Spark creates a visible window, reports the new version, and reaches SparkCore ready without the known Foundation crashes.
+The notification watcher and Wine clipboard manager remain active.
+CLI 1.3.1 passes help, version, and read-only account checks with existing account state.
+
+Mail, calendar, attachments, notification delivery, and both message copy actions remain unverified on this release.
+
+## Native notifications
+
+Spark's new-mail notifications use Windows toasts, which Wine stubs out. Mail
+events arrive, and the push pipeline is visible in the log, but nothing
+displays.
+
+`mail-notify.py` bridges this. It polls Spark's own `messages.sqlite`
+read-only, every 15 seconds, for rows where `unseen = 1 AND inInbox = 1 AND
+inSent = 0`. It calls `notify-send` for each new row.
+
+Two details matter in the watermark logic:
+
+- On first run the watermark adopts the current maximum primary key, so the
+  existing backlog produces no notifications.
+- The watermark advances only past rows that matched the filter. Spark inserts
+  a message row before it sets the inbox and unseen flags. A watermark that
+  tracked the maximum key over every row could step over a message during that
+  gap, and never notify for it.
+
+A `flock` guard keeps the OAuth callback path, which also runs the launcher,
+from starting a second watcher.
+
+Result: a real incoming message produced a native desktop notification within
+one poll interval.
+
+## Current shim stack on Foundation.dll
+
+| Import | Was | Now | Shim behaviour |
+|---|---|---|---|
+| `GetAllUsersProfileDirectoryW` | `USERENV.dll`, a Wine stub | `sprkenv.dll` | Returns `C:\ProgramData` with correct sizing |
+| `GetProfilesDirectoryW` | `USERENV.dll` | `sprkenv.dll` | Forwards to Wine `userenv` through the `.def` file |
+| `GetAdaptersAddresses` | `IPHLPAPI.DLL` | `sprkiphl.dll` | Returns `ERROR_NO_DATA`, an empty adapter list |
+
+## Restore the unpatched app
+
+Stop Spark, then copy the backup over the patched file:
+
+```bash
+cp Foundation.original.dll \
+  "app/resources/app.asar.unpacked/node_modules/@readdle/sparkcore-win/bin/Release/SparkCore.bundle/Foundation.dll"
+```
+
+This removes both import redirects. The shim DLLs then stay on disk, unused.
+To keep only the profile shim, run `shims/patch-foundation.py` again.
+
+## Calendar navigation from the Omarchy plugin
+
+Spark 3.31.5 accepts `readdle-spark://` URLs, but URL acceptance does not select a view.
+The inspected `ProtocolUrlService` handles several URL actions, but none opens the calendar.
+
+Spark's Windows task menu includes a calendar action with the identifier `OPEN_CALENDAR_ACTION`.
+The second-instance handler accepts `--dock-task-id=<actionId>` and forwards the action to the existing renderer.
+The plugin uses this path through `run-spark.sh` and disables desktop helpers for the short invocation.
+
+An event click opens the calendar view without selecting the specific event.
+This internal argument can change after a Spark update.
+On 2026-10-06, the helper exits successfully and Spark displays its calendar controls.
+Local OCR confirms the Today, Week, and October 2026 labels without exposing calendar contents.
+The cold launch path still needs a separate check.
+
+## Office attachment opening
+
+On Spark 3.30.12 with Wine 11.17, clicking an XLSX attachment closed Spark with exit status 1. The Wine trace ended
+in `SHGetFileInfoW` followed by an X11 `BadWindow` error. The exact cause of that X11 error remains unconfirmed.
+PDFs opened normally. The prefix had a `pdffile` association under `HKCR`, but no XLSX association. A disposable XLSX
+stalled before `xdg-open`; after registering XLSX under `HKCR` with `winebrowser.exe`, the same test reached
+`xdg-open` and returned successfully.
+
+The Bubblewrap home overlay hides the host's MIME defaults: XLSX resolved to LibreOffice Calc inside the container,
+while the host selected a different application. A prototype wrapper passed a disposable Office file to the host
+user manager, but repeated clicks on a real attachment did not invoke that wrapper or launch the external handler.
+The live opening path remains unresolved; the prototype wrapper and its WineBrowser override were removed.
+The fallback registration also covers unassociated DOC, DOCX, XLS, PPT, PPTX, ODT, ODS, ODP, CSV, and TSV files;
+these formats were selected because the reference Wine prefix had no default association for them. Their live
+attachment behavior has not been verified.
+
+On Spark 3.31.5 with Wine 11.16, the local prefix also had only a `pdffile` association.
+Without an XLSX association, a click on a draft's XLSX attachment showed a Wine error and Spark stayed open.
+With the fallback associations, DOCX, XLSX, and CSV attachments opened in the host desktop applications.
+`reg` changes made through `run-spark.sh` took effect while Spark ran, because both use the same wineserver.
+
+## Attachment files and downloads
+
+On Pop!_OS 24.04 with COSMIC, Wine 11.16, and Spark 3.31.5, links did nothing, attachments did not open, and
+saved attachments never appeared. The host's default browser is a Flatpak, and so is its PDF handler.
+
+Wine's `xdg-open` runs inside Bubblewrap with the home overlay. For a file it looked up the host handler and
+tried to start the Flatpak there, which fails inside the container. The `host-tools/xdg-open` wrapper covered
+only `http` and `https` links and passed files to the container's `xdg-open`.
+
+The desktop portal does not help for files from inside the container. `OpenURI` rejects `file://` URLs: the
+request returned, but the `Response` signal carried code 2. `OpenFile` with a file descriptor returned code 0
+only for a file under the plain root bind. For a file under the `/tmp` bind it returned code 2, and for a file
+inside the Wine prefix no response arrived within 8 seconds while the portal logged a window it could not
+attach. Attachments live in the prefix, so this route was dropped.
+
+The user's systemd manager runs outside the container and keeps the session environment. `systemd-run --user`
+from inside the container returned in 30 ms, and the host `xdg-open` started the host image viewer on a PNG
+inside the prefix. `winebrowser.exe` converts a Windows path to a `file://` URL, so the wrapper routes those URLs
+and absolute paths to `bin/open-host-file.py`, which maps the container's `/tmp`, home overlay, and download
+mount back to host paths and starts that service with a fixed description, so the journal records no file name.
+
+Associations registered under `HKEY_CURRENT_USER\Software\Classes` were not found by Wine's `ShellExecute`
+(`ShellExecute_GetClassKey` reported no class for `.txt`). Keys under `HKEY_CLASSES_ROOT` worked, which is where
+`register-host-filetypes.sh` writes. The fallback list now includes PDF, text, image, archive, calendar, contact,
+and media types that the reference prefix did not associate.
+
+Wine links the prefix's `Downloads` folder to `$HOME/Downloads`. Inside the container that path is the home
+overlay, so downloads landed in `test-home/Downloads`. The launcher now mounts the host download directory at
+`$HOME/Downloads` inside the container. With that mount, a saved attachment appeared in the host directory.
+
+Checks on 2026-10-08 with the running app: a link clicked in a message opened the host Flatpak browser, a DOCX
+attachment opened in the host application, and an attachment saved from a message appeared in the host
+download directory. `start.exe /unix` on a PNG inside the prefix and on one under the container's `/tmp`
+opened the host image viewer, and the journal recorded only the fixed service description.
+
+### Corrections for the standard project layout
+
+The home mapping originally rewrote attachment paths under `~/Projects`, including the separately bound prefix.
+The helper now resolves symlinks and selects the longest matching mount.
+Project, app, and prefix binds retain their host paths.
+
+The transient service disables environment expansion to preserve filenames that contain `${HOME}`.
+It suppresses service output because a fixed description does not prevent handler errors from logging filenames.
+An `exec` service reports executable startup failures, while visible application behavior still requires a separate check.
+
+The association script exports the registry once and reads default values without localized query labels.
+It preserves nonempty defaults and fills missing or empty defaults.
+If export or parsing fails, it stops before import.
+
+The launcher creates missing download directories and rejects relative download paths.
+Direct Wine mode does not create directories or add mounts.
+These corrections have regression tests; a successful host viewer launch remains a separate runtime check.
+
+## Image paste
+
+On Spark 3.31.5 with Wine 11.16, `Ctrl+V` with an image on the Wayland clipboard inserted nothing.
+With the image watcher, the same paste inserted the image.
+Without Spark focus, Wine did not receive the Wayland image selection, so the watcher acts only while Spark has focus.
+
+In the first session with the watcher, Spark closed shortly after a paste.
+Spark's log stopped without an error, and the terminal output was not kept. The cause is unconfirmed.
+A later session pasted images without a crash.
+
+The first watcher started a Wine process every 0.6 seconds for an image that did not convert.
+`wl-paste --watch` reported no clipboard changes on Hyprland, so the watcher still polls.
+It now makes at most three attempts for each clipboard offer.
+
+## Window lost after a monitor change
+
+On Spark 3.31.5 with Wine 11.16, **Open Spark** did nothing after hyprmoncfg disabled two of three monitors.
+Spark ran, but Hyprland listed no Spark client. The main X11 window had `WM_STATE` Withdrawn.
+Inside Wine, the same window was visible, not minimized, and at x=4928. Wine's virtual screen was 3840 pixels wide.
+
+Wine unmaps a visible window that lies outside its virtual screen and keeps its Windows state.
+Spark's second-instance handler calls `show()` only for a hidden window, so it did nothing.
+A `SetWindowPos` call into the primary monitor's work area made Wine map the window again.
+
+`bin/window-rescue.c` makes that call for each visible Spark frame that is on no monitor.
+`run-spark.sh` runs it before a desktop launch forwards to a running Spark instance.
+The desktop launcher, the URL handler, and the Omarchy plugin all use that path.
+
+## Journal sockets as standard output
+
+On GNOME with X11, Wine 11.16, and Spark 3.32.0, every launch from the Shell's application grid showed a JavaScript error.
+The error was `Error: open EBADF at new Socket (node:net)` from `process.getStdout`.
+Spark's main window never mapped and its log received nothing.
+
+A launch from a terminal worked, as did `gtk-launch` with `/dev/null` on stdout.
+The process GNOME started had `socket:[...]` on file descriptors 1 and 2.
+The Shell sends application output to the journal through a stream socket with the desktop entry as identifier.
+
+Under Wine, Node's stdout initialization fails with that socket.
+`systemd-cat`, which connects stdio to the journal the same way, reproduces the condition.
+Native Windows writes through a socket work in a probe with Wine 11.16, so the evidence concerns Electron's stream initialization.
+
+The launcher detects socket stdio on a desktop launch and redirects output to `tmp/launch.log`.
+Each socket launch truncates that file.
+CLI calls and Wine tools keep their streams because callers read them.
+
+With that change, the `systemd-cat` launch mapped the main window in 14 seconds with no dialog.
+On Omarchy, Spark's embedded Electron runtime also passes socket checks through the launcher with the existing Wine prefix and Bubblewrap mounts.
+Piped output still produces `EBADF` on that host, both before and after this change.
+
+## Open observations
+
+These conditions were seen during a 3.30.12 install on Omarchy 4.0.3 with
+Wine 11.17. None has a proven root cause. Treat each as a recorded condition,
+not a diagnosis.
+
+**Partial extraction.** `bsdtar` stopped silently partway through the NSIS
+installer. About 170 files never reached `app/`, including `Spark
+Desktop.exe`, the V8 snapshots, and most of the SparkCore bundle. The later
+errors (`Error loading V8 startup snapshot file`, `Cannot find module
+'@readdle/sparkcore-win'`) pointed nowhere near the real cause. Recovery:
+compare `bsdtar -tf` against the extracted tree, then extract the missing
+entries with `bsdtar -T`. `install.sh` now runs this check on every install.
+
+**GPU process failure.** The first launch failed with `GPU process isn't
+usable. Goodbye.` Adding Electron's `--disable-gpu` argument worked. The same
+version starts with default settings on the reference host, so the condition
+is host-dependent.
+
+**Fatal error with the notification watcher.** One launch with the watcher
+enabled reached `Application is ready` and then died with `FATAL ERROR ...
+spark-js-addon ... CNAPI.swift ... invalid_arg`. Launches with
+`SPARK_NOTIFY=0` stayed up. The watcher is a separate read-only Python
+process, so a causal link is doubtful and unproven. Isolation work is open.

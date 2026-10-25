@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# Launch Spark Desktop under Wine inside a Bubblewrap filesystem container.
+#
+# The repository directory holds the Wine prefix, the extracted app, and a
+# writable home overlay. Nothing is installed system-wide.
+#
+# Warning: this is filesystem containment, not a security sandbox. The app
+# keeps host network and host display access.
+#
+# Environment overrides:
+#   SPARK_ROOT       project directory (default: this script's directory)
+#   SPARK_APP        application directory (default: SPARK_ROOT/app)
+#   SPARK_PREFIX     Wine prefix (default: SPARK_ROOT/prefix)
+#   SPARK_WINE       wine binary (default: bundled runtime, else wine in PATH)
+#   SPARK_DEBUG      WINEDEBUG value
+#   SPARK_OVERRIDES  WINEDLLOVERRIDES value
+#   SPARK_EXE        Windows executable to run, as a Unix path or a C:\ path
+#   SPARK_CONTAINER  1 for Bubblewrap (default), 0 for direct Wine
+#   SPARK_IMAGE_BRIDGE  0 disables the image clipboard watcher
+#   SPARK_DOWNLOADS  host directory mounted at $HOME/Downloads inside the
+#                    container (default: the XDG download directory); empty disables
+set -euo pipefail
+
+root=${SPARK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
+config=${SPARK_CONFIG:-$root/spark.local.env}
+if [ -f "$config" ]; then
+  # This optional file is local, ignored by Git, and trusted like the launcher.
+  # shellcheck source=/dev/null
+  source "$config"
+fi
+app=$(readlink -f "${SPARK_APP:-$root/app}")
+prefix=$(readlink -f "${SPARK_PREFIX:-$root/prefix}")
+home_overlay=$root/test-home
+tmp_dir=$root/tmp
+
+wine=${SPARK_WINE:-}
+if [ -z "$wine" ]; then
+  if [ -x "$root/runtime/usr/bin/wine" ]; then
+    wine=$root/runtime/usr/bin/wine
+  else
+    wine=$(command -v wine || true)
+  fi
+fi
+[ -n "$wine" ] && [ -x "$wine" ] || { echo "error: no wine binary. Set SPARK_WINE." >&2; exit 1; }
+
+if [ "${SPARK_CLI:-0}" = 1 ]; then
+  exe=$app/resources/app.asar.unpacked/node_modules/@readdle/sparkcore-win/bin/Release/SparkCore.bundle/spark.exe
+else
+  exe=${SPARK_EXE:-$app/Spark Desktop.exe}
+fi
+# A C:\ path names a Wine tool inside the prefix, which may not exist yet.
+case $exe in
+  [A-Za-z]:\\*) ;;
+  *) [ -f "$exe" ] || { echo "error: missing $exe. Extract the installer first." >&2; exit 1; } ;;
+esac
+
+# A Spark update can replace Foundation.dll while leaving old shims beside the
+# executable. Reject any vulnerable native imports that still need redirecting.
+# Older Spark builds do not import every affected DLL, so require a shim only
+# when Foundation actually references its replacement.
+foundation=$app/resources/app.asar.unpacked/node_modules/@readdle/sparkcore-win/bin/Release/SparkCore.bundle/Foundation.dll
+if [ -f "$foundation" ]; then
+  if grep -qai 'USERENV.dll' "$foundation"; then
+    echo 'error: Foundation.dll still imports USERENV.dll.' >&2
+    echo "A Spark update probably reverted the patches. Reapply them:" >&2
+    echo "  python3 $root/shims/patch-foundation.py" >&2
+    echo "  python3 $root/shims/patch-iphlpapi.py" >&2
+    exit 1
+  fi
+  for replacement in sprkenv.dll sprkiphl.dll; do
+    if grep -qa "$replacement" "$foundation" && [ ! -f "$app/$replacement" ]; then
+      echo "error: missing $app/$replacement. Run shims/build.sh." >&2
+      exit 1
+    fi
+  done
+  # The adapter crash affects the newer Foundation build that also imports
+  # USERENV. Older builds have no USERENV dependency and can keep IPHLPAPI.
+  if grep -qa 'sprkenv.dll' "$foundation" && grep -qai 'IPHLPAPI.DLL' "$foundation"; then
+    echo 'error: Foundation.dll still imports IPHLPAPI.DLL.' >&2
+    echo "Run: python3 $root/shims/patch-iphlpapi.py" >&2
+    exit 1
+  fi
+fi
+
+mkdir -p "$tmp_dir" "$home_overlay"
+
+# GNOME Shell starts applications with stdout and stderr connected to the
+# journal through a socket. Under Wine, Electron fails with "open EBADF"
+# when it initializes process.stdout with that socket. Send desktop output
+# to a file instead.
+# CLI calls and Wine tools keep their streams, because callers read them.
+if [ -z "${SPARK_EXE:-}" ] && [ "${SPARK_CLI:-0}" != 1 ] && { [ -S /dev/fd/1 ] || [ -S /dev/fd/2 ]; }; then
+  exec </dev/null >"$tmp_dir/launch.log" 2>&1
+fi
+
+# Wine links the prefix's Downloads folder to $HOME/Downloads. Inside the
+# container that path lies in the home overlay, so saved attachments would
+# vanish there. Mount the host download directory at the same place.
+downloads_bind=()
+if [ "${SPARK_DOWNLOADS+set}" = set ]; then
+  downloads=$SPARK_DOWNLOADS
+else
+  downloads=$(xdg-user-dir DOWNLOAD 2>/dev/null || true)
+  [ -n "$downloads" ] && [ "$downloads" != "$HOME" ] || downloads=$HOME/Downloads
+fi
+downloads_mount=
+if [ "${SPARK_CONTAINER:-1}" != 0 ] && [ -n "$downloads" ]; then
+  case $downloads in
+    /*) ;;
+    *) echo 'error: SPARK_DOWNLOADS must be an absolute directory or empty.' >&2; exit 1 ;;
+  esac
+  mkdir -p "$downloads"
+  downloads=$(readlink -f "$downloads")
+  mkdir -p "$home_overlay/Downloads"
+  downloads_bind=(--bind "$downloads" "$HOME/Downloads")
+  downloads_mount=$downloads
+fi
+
+# Wine unmaps a visible window that lies outside its screen, for example after a
+# monitor is removed. Spark then ignores a second launch. Move such windows into
+# view before this launch forwards to the running instance.
+spark_running() {
+  local pid
+  for pid in $(pgrep -f 'Spark Desktop\.exe' || true); do
+    grep -qzxF "SPARK_ROOT=$root" "/proc/$pid/environ" 2>/dev/null && return 0
+  done
+  return 1
+}
+rescue=$root/.build/window-rescue.exe.so
+if [ -z "${SPARK_EXE:-}" ] && [ "${SPARK_CLI:-0}" != 1 ] && [ -f "$rescue" ] && spark_running; then
+  SPARK_EXE=$rescue SPARK_NOTIFY=0 SPARK_CLOSE_TRAY=0 SPARK_IMAGE_BRIDGE=0 \
+    "${BASH_SOURCE[0]}" || echo 'warning: window rescue failed.' >&2
+fi
+
+# Spark's Windows toast notifications do not render under Wine. This watcher
+# bridges new mail to notify-send. The trap covers every exit path, including
+# a nonzero wine exit under 'set -e' and an interrupt.
+# Set SPARK_NOTIFY=0 for short-lived invocations such as the Spark CLI.
+watcher=
+tray_closer=
+image_watcher=
+cleanup() {
+  if [ -n "$watcher" ]; then
+    kill "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+  fi
+  if [ -n "$tray_closer" ]; then
+    kill "$tray_closer" 2>/dev/null || true
+    wait "$tray_closer" 2>/dev/null || true
+  fi
+  if [ -n "$image_watcher" ]; then
+    kill "$image_watcher" 2>/dev/null || true
+    wait "$image_watcher" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+if [ "${SPARK_NOTIFY:-1}" != 0 ] && { [ -x "$root/bin/mail-notify.py" ] || [ -f "$root/bin/mail-notify.py" ]; }; then
+  SPARK_ROOT=$root SPARK_PREFIX=$prefix python3 "$root/bin/mail-notify.py" &
+  watcher=$!
+fi
+
+# Wine's explorer.exe manages the clipboard and exposes a standalone tray window.
+# Hide only that window after Spark's renderer exists in this Wine prefix.
+if [ "${SPARK_CLOSE_TRAY:-1}" != 0 ] && [ -f "$root/bin/close-tray.py" ]; then
+  python3 "$root/bin/close-tray.py" "$prefix" &
+  tray_closer=$!
+fi
+
+# Wine can expose image-only selections without CF_DIB, which Spark's editor
+# needs. The watcher adds it when Spark's XWayland window has focus.
+if [ "${SPARK_IMAGE_BRIDGE:-1}" != 0 ] && [ "${SPARK_CLI:-0}" != 1 ] &&
+   [ -f "$root/.build/clipboard-image.exe.so" ] &&
+   command -v hyprctl >/dev/null 2>&1 && command -v wl-paste >/dev/null 2>&1; then
+  python3 "$root/bin/clipboard-image-watch.py" &
+  image_watcher=$!
+fi
+
+status=0
+overrides=${SPARK_OVERRIDES:-winemenubuilder.exe=d;powershell.exe,pwsh.exe=d;mscoree=d;mshtml=d;ucrtbase,concrt140,msvcp140,msvcp140_1,msvcp140_2,msvcp140_atomic_wait,msvcp140_codecvt_ids,vcamp140,vccorlib140,vcomp140,vcruntime140,vcruntime140_1,vcruntime140_threads=n,b}
+debug=${SPARK_DEBUG:--all}
+wine_path=$PATH
+# Wine finds this xdg-open wrapper before the system command.
+# Keep browser integration out of Wine's startup sequence.
+if [ "${SPARK_CLI:-0}" != 1 ]; then
+  wine_path=$root/bin/host-tools:$PATH
+fi
+if [ "${SPARK_CONTAINER:-1}" = 0 ]; then
+  (
+    cd "$app"
+    export SPARK_ROOT=$root WINEPREFIX=$prefix WINEDLLOVERRIDES=$overrides WINEDEBUG=$debug PATH=$wine_path
+    "$wine" "$exe" "$@"
+  ) || status=$?
+else
+  bwrap \
+    --ro-bind / / \
+    --dev-bind /dev /dev \
+    --proc /proc \
+    --bind "$home_overlay" "$HOME" \
+    "${downloads_bind[@]}" \
+    --bind "$root" "$root" \
+    --bind "$prefix" "$prefix" \
+    --bind "$app" "$app" \
+    --bind "$tmp_dir" /tmp \
+    --ro-bind /tmp/.X11-unix /tmp/.X11-unix \
+    --setenv WINEPREFIX "$prefix" \
+    --setenv SPARK_ROOT "$root" \
+    --setenv SPARK_APP "$app" \
+    --setenv SPARK_CONTAINER_HOME "$home_overlay" \
+    --setenv SPARK_CONTAINER_TMP "$tmp_dir" \
+    --setenv SPARK_DOWNLOADS_DIR "$downloads_mount" \
+    --setenv WINEDLLOVERRIDES "$overrides" \
+    --setenv WINEDEBUG "$debug" \
+    --setenv PATH "$wine_path" \
+    --chdir "$app" \
+    "$wine" "$exe" "$@" || status=$?
+fi
+
+exit "$status"
