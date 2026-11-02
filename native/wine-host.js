@@ -94,6 +94,14 @@ readFrames(sock, (frame) => {
       }
       break;
     }
+    case 'classifyUrl':
+      try {
+        const action = require(process.env.SPARK_ADDON_PATH).getActionForURLToOpen(frame.url, frame.client);
+        send({ k: 'urlAction', id: frame.id, action });
+      } catch (error) {
+        send({ k: 'urlAction', id: frame.id, error: String(error.message) });
+      }
+      break;
     case 'kill':
       process.exit(0);
   }

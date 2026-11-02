@@ -35,6 +35,7 @@ Docker does not replace the host display, Wine prefix, or desktop integration in
 | `bin/clipboard-image-watch.py` | Adds `CF_DIB` to image-only clipboard selections while Spark has focus. |
 | `bin/clipboard-image.c` | Wine helper that converts the clipboard image. `bin/build-wine-helpers.sh` builds it. |
 | `bin/window-rescue.c` | Wine helper that moves off-screen Spark windows back into view. `bin/build-wine-helpers.sh` builds it. |
+| `native/` | Experimental mode: native Linux Electron UI with Spark's backend in Wine. See `native/README.md`. |
 | `share/` | Contains desktop integration templates. |
 | `tests/` | Covers desktop registration, OAuth validation, notification polling, the image watcher, the launcher, and the portal helpers. |
 | `docs/investigation.md` | Records the Wine failures and the evidence for each workaround. |

@@ -12,8 +12,13 @@ to the primary process. No second app instance starts.
 
 The log records the timestamp and the scheme only. The URL carries the
 authorization code and is never written to disk.
+
+While native mode (native/run-native.sh) runs, it receives the URL instead:
+Electron's single-instance lock passes it to that process.
 """
+import getpass
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -40,6 +45,18 @@ ALLOWED_SCHEMES = {
 }
 
 
+def native_mode_running():
+    """Read the lock Electron holds, a symlink to <hostname>-<pid>."""
+    state = os.environ.get('SPARK_NATIVE_STATE') or os.path.join(ROOT, 'native-state')
+    try:
+        host, _, pid = os.readlink(os.path.join(
+            state, 'prefix', 'drive_c', 'users', getpass.getuser(), 'AppData', 'Local',
+            'Spark Desktop', 'SingletonLock')).rpartition('-')
+    except OSError:
+        return False
+    return host == socket.gethostname() and pid.isdigit() and os.path.exists(f'/proc/{pid}')
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit('usage: auth-callback.py <callback-url>')
@@ -49,8 +66,9 @@ def main():
     with open(os.path.join(ROOT, 'auth-callback.log'), 'a') as log:
         log.write('%s scheme=%s\n' % (time.strftime('%F %T'), scheme))
     env = dict(os.environ, SPARK_ROOT=ROOT, SPARK_DEBUG='-all')
+    launcher = ('native/run-native.sh' if native_mode_running() else 'run-spark.sh')
     result = subprocess.run(
-        ['/usr/bin/env', 'bash', os.path.join(ROOT, 'run-spark.sh'),
+        ['/usr/bin/env', 'bash', os.path.join(ROOT, launcher),
          '--win-open-url', sys.argv[1]],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     sys.exit(result.returncode)

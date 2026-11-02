@@ -38,10 +38,49 @@ function stub(name) {
   });
 }
 
+// URL rules live in the real addon, which only loads under Wine, but Spark asks
+// synchronously. The shim resolves a URL over the bridge and stores it here first.
+const urlActions = new Map();
+
+// Spark's Windows notification path, shown through the Linux notification service.
+class LinuxNotificationManager {
+  constructor() {
+    this.delegate = null;
+    this.live = new Set();
+  }
+  async subscribe(delegate) {
+    this.delegate = delegate;
+  }
+  async prepare() {}
+  async showNotification(title, subtitle, body, action, silent) {
+    const { Notification } = require('electron');
+    const text = [subtitle, body].filter(Boolean).join('\n');
+    const notification = new Notification({ title, body: text, silent: Boolean(silent) });
+    const release = () => this.live.delete(notification);
+    this.live.add(notification); // An unreferenced notification loses its click handler.
+    notification.on('click', () => {
+      release();
+      this.delegate?.onNotificationWasActivated(action);
+    });
+    notification.on('close', release);
+    notification.on('failed', (_event, error) => {
+      release();
+      this.delegate?.onErrorOccured(String(error));
+    });
+    notification.show();
+  }
+  async cleanup() {
+    for (const notification of this.live) notification.close();
+    this.live.clear();
+  }
+}
+
 const overrides = {
   getActionForURLToOpen(url) {
+    if (urlActions.has(url)) return urlActions.get(url);
     return typeof url === 'string' && /^mailto:/i.test(url) ? { type: 'mailto', url } : { type: 'unknown' };
   },
+  WinRTNotificationManager: LinuxNotificationManager,
 };
 
 const KNOWN = new Set([
@@ -61,4 +100,4 @@ const addon = new Proxy(generic, {
   },
 });
 
-module.exports = { default: addon, __esModule: true };
+module.exports = { default: addon, urlActions, __esModule: true };

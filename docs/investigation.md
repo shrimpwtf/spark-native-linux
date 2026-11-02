@@ -417,3 +417,24 @@ enabled reached `Application is ready` and then died with `FATAL ERROR ...
 spark-js-addon ... CNAPI.swift ... invalid_arg`. Launches with
 `SPARK_NOTIFY=0` stayed up. The watcher is a separate read-only Python
 process, so a causal link is doubtful and unproven. Isolation work is open.
+
+## AI Assistant: "device doesn't meet the requirements"
+
+Spark logged this for both the Wine mode and the native mode on Wine 11.21:
+
+```text
+embeddings model is not supported onnxError(1, "... DMLProviderFactoryCreator::CreateFromDeviceOptions
+No devices detected that match the filter criteria.")
+```
+
+The GPU was not the cause. A probe in the same Bubblewrap setup created a D3D12 device and a DirectML device on an RTX 5080.
+Wine's `dxcore.dll` listed one adapter, but `IDXCoreAdapter::IsAttributeSupported` returned false for every attribute, and `IDXCoreAdapterList::Sort` returned `E_NOTIMPL`.
+`onnxruntime.dll` references the D3D12 graphics attribute, and it stopped reporting this error once the shim corrected those answers.
+
+`shims/dxcore-shim.c` builds `sprkdx.dll`, which patches the answers into Wine's interface tables. `shims/patch-onnxruntime.py` changes the library name onnxruntime loads, which has the same length.
+Two details matter:
+
+- onnxruntime did not find the DLL beside `Spark Desktop.exe`, but it did find it in the prefix's `system32`. The log reports "Failed to load dxcore.dll" when it is missing.
+- onnxruntime frees the DLL between uses, while Wine's interface tables are shared and keep pointing at it. The shim pins itself. Without that, the backend called a null pointer in `CreateAdapterList` about three seconds into each launch, because Spark had saved the passing result.
+
+After the fix, Spark logged `embeddings model supported: true, performance 7 ms`, prepared the embedding model, and started indexing. Only `native/run-native.sh` installs the DLL, so the Wine mode still reports the device as unsupported.

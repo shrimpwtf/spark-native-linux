@@ -70,6 +70,10 @@ class DesktopIntegrationTests(unittest.TestCase):
             self.assertEqual(launcher['Exec'], f'"{ROOT}/run-spark.sh"')
             self.assertEqual(launcher['StartupWMClass'], 'spark desktop.exe')
             self.assertEqual(handler['NoDisplay'], 'true')
+            native = desktop_file(applications / 'spark-desktop.desktop')
+            self.assertNotIn('NoDisplay', native)
+            self.assertEqual(native['StartupWMClass'], 'spark-desktop')
+            self.assertEqual(native['Exec'], f'"{ROOT}/native/run-native.sh"')
             calls = mime_calls.read_text().splitlines()
             self.assertEqual(len(calls), 12)
             self.assertTrue(all(
@@ -97,6 +101,35 @@ class DesktopIntegrationTests(unittest.TestCase):
             self.assertNotIn('secret', log)
             command = run.call_args.args[0]
             self.assertEqual(command[-2:], ['--win-open-url', secret_url])
+
+    def test_callback_goes_to_native_mode_only_while_its_lock_is_live(self):
+        module = auth_callback_module()
+        url = 'oauth.redirect.com.readdle.smartmail://return?code=secret'
+        completed = subprocess.CompletedProcess([], 0)
+
+        def launcher_used(root):
+            module.ROOT = root
+            with mock.patch.dict(os.environ), \
+                    mock.patch.object(sys, 'argv', ['auth-callback.py', url]), \
+                    mock.patch.object(module.subprocess, 'run', return_value=completed) as run:
+                os.environ.pop('SPARK_NATIVE_STATE', None)
+                with self.assertRaises(SystemExit):
+                    module.main()
+            return run.call_args.args[0][2]
+
+        with tempfile.TemporaryDirectory() as root:
+            lock = (Path(root) / 'native-state' / 'prefix' / 'drive_c' / 'users'
+                    / module.getpass.getuser() / 'AppData' / 'Local'
+                    / 'Spark Desktop' / 'SingletonLock')
+            self.assertEqual(launcher_used(root), f'{root}/run-spark.sh')
+
+            lock.parent.mkdir(parents=True)
+            lock.symlink_to(f'{module.socket.gethostname()}-{os.getpid()}')
+            self.assertEqual(launcher_used(root), f'{root}/native/run-native.sh')
+
+            lock.unlink()
+            lock.symlink_to(f'another-host-{os.getpid()}')
+            self.assertEqual(launcher_used(root), f'{root}/run-spark.sh')
 
     def test_callback_rejects_unknown_scheme_before_launch(self):
         module = auth_callback_module()

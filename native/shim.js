@@ -33,9 +33,12 @@ for (const [name, sub] of [['APPDATA', 'Roaming'], ['LOCALAPPDATA', 'Local']]) {
   fs.mkdirSync(process.env[name], { recursive: true });
 }
 
+const addonStub = require('./addon-stub');
+let electronForApp = null;
 const originalLoad = Module._load;
 Module._load = function (request) {
-  if (request === '@readdle/sparkcore-win') return require('./addon-stub');
+  if (request === 'electron' && electronForApp) return electronForApp;
+  if (request === '@readdle/sparkcore-win') return addonStub;
   if (request === 'electron-clipboard-ex') return new Proxy({}, { get: () => () => undefined });
   return originalLoad.apply(this, arguments);
 };
@@ -61,6 +64,28 @@ function toWinPath(p) {
   return 'Z:' + p.replace(/\//g, '\\');
 }
 
+// Worker paths point inside the container. Downloads is the host's own folder,
+// and the rest of the container's home is the overlay under the state directory.
+function toHostPath(p) {
+  // The leading slash comes from the pathname of a file:///C:/ URL.
+  const match = typeof p === 'string' && /^\/?([A-Za-z]):[\\/](.*)$/s.exec(p);
+  if (!match) return p;
+  const rest = match[2].replace(/\\/g, '/');
+  const home = process.env.HOME || '';
+  const user = path.basename(home);
+  if (match[1].toUpperCase() === 'C') {
+    if (rest.toLowerCase().startsWith(`users/${user}/downloads/`.toLowerCase())) {
+      return path.join(home, 'Downloads', rest.split('/').slice(3).join('/'));
+    }
+    return path.join(prefix, 'drive_c', rest);
+  }
+  if (match[1].toUpperCase() !== 'Z') return p;
+  const unix = `/${rest}`;
+  const bound = [home && `${home}/Downloads/`, `${root}/`, `${process.env.SPARK_STATE || root}/`];
+  if (!home || !unix.startsWith(`${home}/`) || bound.some((dir) => dir && unix.startsWith(dir))) return unix;
+  return path.join(process.env.SPARK_STATE || root, 'test-home', unix.slice(home.length + 1));
+}
+
 function mapPaths(value) {
   if (typeof value === 'string') return value.startsWith('/') ? toWinPath(value) : value;
   if (Array.isArray(value)) return value.map(mapPaths);
@@ -79,6 +104,7 @@ class WineWorker extends EventEmitter {
     this.relays = new Map();
     this.nextId = 1; // ids created here are odd; the Wine side uses even ids
     this.token = crypto.randomBytes(16).toString('hex');
+    this.urlRequests = new Map();
 
     const server = net.createServer((sock) => this.accept(sock, server));
     server.listen(0, '127.0.0.1', () => this.spawnWine(entry, options, server.address().port));
@@ -91,12 +117,16 @@ class WineWorker extends EventEmitter {
       ...(options && options.env),
       ELECTRON_RUN_AS_NODE: '1',
       SPARK_EXE: path.join(appDir, 'Spark Desktop.exe'),
-      SPARK_NOTIFY: '0',
+      // Spark's core raises no notification events here, so run-spark.sh starts the
+      // same database watcher the Wine mode uses and stops it with this worker.
+      SPARK_NOTIFY: '1',
       SPARK_CLOSE_TRAY: '0',
       SPARK_IMAGE_BRIDGE: '0',
       SPARK_BRIDGE_PORT: String(bridgePort),
       SPARK_BRIDGE_TOKEN: this.token,
       SPARK_WORKER_ENTRY: toWinPath(entry),
+      SPARK_ADDON_PATH: toWinPath(path.join(appDir, 'resources', 'app.asar.unpacked', 'node_modules',
+        '@readdle', 'sparkcore-win', 'bin', 'Release', 'SparkCore.bundle', 'SparkCoreAddon')),
     };
     this.proc = spawn(path.join(root, 'run-spark.sh'), [toWinPath(path.join(nativeDir, 'wine-host.js'))], {
       env, stdio: ['ignore', out, out], detached: true,
@@ -164,7 +194,29 @@ class WineWorker extends EventEmitter {
         if (relay) { this.relays.delete(frame.id); relay.close(); }
         break;
       }
+      case 'urlAction': {
+        const request = this.urlRequests.get(frame.id);
+        if (!request) break;
+        this.urlRequests.delete(frame.id);
+        clearTimeout(request.timer);
+        if (frame.error) request.reject(new Error(frame.error));
+        else request.resolve(frame.action);
+        break;
+      }
     }
+  }
+
+  // Ask the real addon, in Wine, how Spark should treat a URL.
+  classifyUrl(url) {
+    return new Promise((resolve, reject) => {
+      const id = this.nextId += 2;
+      const timer = setTimeout(() => {
+        this.urlRequests.delete(id);
+        reject(new Error('timed out'));
+      }, 15000);
+      this.urlRequests.set(id, { resolve, reject, timer });
+      this.send({ k: 'classifyUrl', id, url, client: 'dist' });
+    });
   }
 
   postMessage(data, transfer = []) {
@@ -182,9 +234,155 @@ class WineWorker extends EventEmitter {
 const electron = require('electron');
 const utility = electron.utilityProcess;
 const originalFork = utility.fork.bind(utility);
+let wineWorker = null;
 utility.fork = (modulePath, args, options) => {
-  if (/sparkcore-worker[\\/]main\.js$/.test(modulePath)) return new WineWorker(modulePath, options);
-  return originalFork(modulePath, args, options);
+  if (!/sparkcore-worker[\\/]main\.js$/.test(modulePath)) return originalFork(modulePath, args, options);
+  // A forwarding instance is about to quit. It must not open the primary's databases.
+  if (!electron.app.hasSingleInstanceLock()) {
+    const inert = new EventEmitter();
+    inert.postMessage = () => {};
+    inert.kill = () => true;
+    return inert;
+  }
+  wineWorker = new WineWorker(modulePath, options);
+  return wineWorker;
+};
+
+// Mirrors how Spark reads a forwarded URL. Never log the result: it can carry
+// an authorization code.
+function forwardedUrl(argv) {
+  const prefixArg = '--second-instance=';
+  const forwarded = argv.find((arg) => arg.startsWith(prefixArg));
+  if (!forwarded) return null;
+  const args = JSON.parse(forwarded.slice(prefixArg.length));
+  const at = args.indexOf('--win-open-url');
+  if (at < 0) return null;
+  const url = args[at + 1] === '--' ? args[at + 2] : args[at + 1];
+  return url && !url.startsWith('-') ? url : null;
+}
+
+const appOn = electron.app.on.bind(electron.app);
+electron.app.on = (event, listener) => {
+  if (event !== 'second-instance') return appOn(event, listener);
+  return appOn(event, async (e, argv, ...rest) => {
+    let url = null;
+    try {
+      url = forwardedUrl(argv);
+      if (url && wineWorker) {
+        const action = await wineWorker.classifyUrl(url);
+        addonStub.urlActions.set(url, action);
+        log(`forwarded URL action=${action.type}`);
+      }
+    } catch (error) {
+      log(`forwarded URL not classified: ${error.message}`);
+    }
+    listener(e, argv, ...rest);
+    if (url) addonStub.urlActions.delete(url);
+  });
+};
+
+// The host's URL handlers belong to install-handler.sh. Electron would otherwise
+// point them at this runtime.
+electron.app.setAsDefaultProtocolClient = () => true;
+electron.app.removeAsDefaultProtocolClient = () => true;
+
+// Spark calls these Windows and macOS APIs unguarded because it reports win32.
+// A TypeError from one is an unhandled rejection, and Spark quits on those.
+electron.app.setUserTasks = () => true;
+electron.app.hide = () => {};
+electron.systemPreferences.getMediaAccessStatus = () => 'not-determined';
+electron.systemPreferences.askForMediaAccess = async () => false;
+
+// The worker's attachment URLs are file:///C:/... and Spark converts them with the
+// Linux rules, which gives /C:/... instead of a real path.
+const nodeUrl = require('url');
+const fileURLToPath = nodeUrl.fileURLToPath;
+nodeUrl.fileURLToPath = (url, options) => {
+  const converted = fileURLToPath(url, options);
+  return /^\/[A-Za-z]:\//.test(converted) ? toHostPath(converted.slice(1)) : converted;
+};
+
+// Avatars, previews, and inline images arrive as Windows paths or file:///C:/ URLs.
+function toHostFileUrl(value) {
+  return /^file:\/\/\/[A-Za-z]:\//i.test(value)
+    ? nodeUrl.pathToFileURL(nodeUrl.fileURLToPath(value)).href
+    : value;
+}
+const { protocol, net: electronNet } = electron;
+const handleProtocol = protocol.handle.bind(protocol);
+protocol.handle = (scheme, handler) => handleProtocol(scheme, (request) => {
+  const url = new URL(request.url);
+  const filePath = url.searchParams.get('path');
+  const fileUrl = url.searchParams.get('fileUrl');
+  if (filePath) url.searchParams.set('path', toHostPath(filePath));
+  if (fileUrl) url.searchParams.set('fileUrl', toHostFileUrl(fileUrl));
+  if (url.href === new URL(request.url).href) return handler(request);
+  return handler(new Request(url.href, { method: request.method, headers: request.headers }));
+});
+const netFetch = electronNet.fetch.bind(electronNet);
+electronNet.fetch = (input, init) => netFetch(typeof input === 'string' ? toHostFileUrl(input) : input, init);
+
+const { shell, nativeImage } = electron;
+const openPath = shell.openPath.bind(shell);
+const showItemInFolder = shell.showItemInFolder.bind(shell);
+shell.openPath = (p) => openPath(toHostPath(p));
+shell.showItemInFolder = (p) => showItemInFolder(toHostPath(p));
+
+// Spark's tray icon is an .ico, which Electron only decodes on Windows.
+function imageFromIco(file) {
+  const ico = fs.readFileSync(file);
+  let best = null;
+  for (let i = 0; i < ico.readUInt16LE(4); i += 1) {
+    const at = 6 + i * 16;
+    const size = ico[at] || 256;
+    if (!best || size > best.size) {
+      best = { size, bytes: ico.readUInt32LE(at + 8), offset: ico.readUInt32LE(at + 12) };
+    }
+  }
+  if (!best) return nativeImage.createEmpty();
+  const data = ico.subarray(best.offset, best.offset + best.bytes);
+  if (data.subarray(1, 4).toString('latin1') === 'PNG') return nativeImage.createFromBuffer(data);
+  // Other entries are bottom-up BGRA bitmaps that follow a BITMAPINFOHEADER.
+  const row = best.size * 4;
+  const bitmap = Buffer.alloc(row * best.size);
+  const pixels = data.readUInt32LE(0);
+  for (let y = 0; y < best.size; y += 1) {
+    data.copy(bitmap, y * row, pixels + (best.size - 1 - y) * row, pixels + (best.size - y) * row);
+  }
+  return nativeImage.createFromBitmap(bitmap, { width: best.size, height: best.size });
+}
+// Spark rebuilds its tray after sign-in. On Linux, a second Tray in one process
+// collides with the first on D-Bus and stops responding, so keep just one.
+const RealTray = electron.Tray;
+let sharedTray = null;
+let trayDestroyed = false;
+function ReusableTray(image) {
+  trayDestroyed = false;
+  if (sharedTray) {
+    sharedTray.setImage(image);
+    return sharedTray;
+  }
+  sharedTray = new RealTray(image);
+  sharedTray.destroy = () => {
+    trayDestroyed = true;
+    sharedTray.setContextMenu(null);
+  };
+  sharedTray.isDestroyed = () => trayDestroyed;
+  return sharedTray;
+}
+electronForApp = new Proxy(electron, {
+  get: (target, prop) => (prop === 'Tray' ? ReusableTray : target[prop]),
+});
+
+const createFromPath = nativeImage.createFromPath.bind(nativeImage);
+nativeImage.createFromPath = (file) => {
+  if (!/\.ico$/i.test(file)) return createFromPath(toHostPath(file));
+  try {
+    return imageFromIco(file);
+  } catch (error) {
+    log(`icon not decoded: ${error.message}`);
+    return nativeImage.createEmpty();
+  }
 };
 const snapshotDir = process.env.SPARK_NATIVE_SNAPSHOT;
 if (snapshotDir) {
@@ -200,5 +398,12 @@ if (snapshotDir) {
     }
   }, Number(process.env.SPARK_NATIVE_SNAPSHOT_DELAY_MS || 15000)));
 }
+
+// Spark quits on an unhandled rejection and logs it as {}. Keep the code location,
+// but not the message, which can contain account details.
+process.on('unhandledRejection', (reason) => {
+  const frames = String(reason?.stack || '').split('\n').filter((line) => /^\s+at /.test(line));
+  log(`unhandled rejection ${reason?.name || typeof reason}\n${frames.slice(0, 12).join('\n')}`);
+});
 
 log('shim loaded');

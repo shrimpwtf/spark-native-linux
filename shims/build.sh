@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the two Foundation.dll compatibility shims as PE DLLs.
+# Build the Foundation.dll and onnxruntime.dll compatibility shims as PE DLLs.
 #
 # Requires clang and a PE-capable ld (Arch: pacman -S clang llvm binutils).
 # The shims link against Wine's own PE import libraries, so a mingw-w64
@@ -49,8 +49,15 @@ clang --target="$target" -nostdlib -shared \
   -o "$out/sprkiphl.dll" \
   "$here/adapter-shim.c"
 
-for dll in sprkenv.dll sprkiphl.dll; do
+# sprkdx.dll wraps Wine's dxcore.dll for onnxruntime.dll's DirectML device search.
+clang --target="$target" -nostdlib -shared \
+  -L "$libdir" \
+  -o "$out/sprkdx.dll" \
+  "$here/dxcore-shim.c" \
+  -lkernel32
+
+for dll in sprkenv.dll sprkiphl.dll sprkdx.dll; do
   test -f "$out/$dll" || { echo "error: $dll was not produced" >&2; exit 1; }
 done
-echo "Built $out/sprkenv.dll and $out/sprkiphl.dll"
-echo "Copy both next to 'Spark Desktop.exe', then run the patch scripts."
+echo "Built $out/sprkenv.dll, $out/sprkiphl.dll, and $out/sprkdx.dll"
+echo "Copy them next to 'Spark Desktop.exe', then run the patch scripts."

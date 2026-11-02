@@ -8,9 +8,12 @@ set -euo pipefail
 root=${SPARK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 auth_template=$root/share/spark-mail-linux-auth.desktop.in
 launcher_template=$root/share/spark-mail-linux.desktop.in
+native_template=$root/share/spark-mail-linux-native.desktop.in
 dest_dir=${XDG_DATA_HOME:-$HOME/.local/share}/applications
 auth_dest=$dest_dir/spark-mail-linux-auth.desktop
 launcher_dest=$dest_dir/spark-mail-linux.desktop
+# Electron's Wayland app ID comes from Spark's name, and desktops match it to this file name.
+native_dest=$dest_dir/spark-desktop.desktop
 
 [ -f "$auth_template" ] || { echo "error: missing $auth_template" >&2; exit 1; }
 [ -f "$launcher_template" ] || { echo "error: missing $launcher_template" >&2; exit 1; }
@@ -21,9 +24,15 @@ escaped_root=${escaped_root//&/\\&}
 escaped_root=${escaped_root//|/\\|}
 sed "s|@SPARK_ROOT@|$escaped_root|g" "$auth_template" > "$auth_dest"
 sed "s|@SPARK_ROOT@|$escaped_root|g" "$launcher_template" > "$launcher_dest"
+if [ -f "$native_template" ]; then
+  sed "s|@SPARK_ROOT@|$escaped_root|g" "$native_template" > "$native_dest"
+fi
 
 if ! "$root/bin/extract-icons.sh" "$root/app/Spark Desktop.exe" "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"; then
   sed -i 's|^Icon=.*|Icon=mail-unread|' "$launcher_dest"
+  if [ -f "$native_dest" ]; then
+    sed -i 's|^Icon=.*|Icon=mail-unread|' "$native_dest"
+  fi
   echo "warning: could not extract Spark icon (needs icoutils); using generic icon" >&2
 fi
 command -v update-desktop-database >/dev/null && update-desktop-database "$dest_dir" || true

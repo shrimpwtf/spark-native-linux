@@ -5,6 +5,7 @@ prefix/
 /app
 /prefix
 test-home/
+native-state/
 runtime/
 tmp/
 .build/

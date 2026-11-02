@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Spark Mail (Native)
+Comment=Smart email client with a native Linux interface (experimental)
+Exec="@SPARK_ROOT@/native/run-native.sh"
+Path=@SPARK_ROOT@
+Icon=spark-mail-linux
+Terminal=false
+StartupNotify=true
+StartupWMClass=spark-desktop
+Categories=Network;Email;
+Keywords=email;mail;spark;

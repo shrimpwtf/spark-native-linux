@@ -2,7 +2,7 @@
 
 Derived from [spark-mail-linux](https://github.com/kyryl-bogach/spark-mail-linux) by Kyryl Bogach. See [Credits](#credits).
 An experimental mode that runs Spark's interface in native Linux Electron lives in [native/](native/README.md).
-It is not ready for daily use. Run it only against a test Wine prefix: its backend opens the databases of whichever prefix it runs in.
+It is experimental. It keeps its own Wine prefix in `native-state/`, so you sign in separately from the Wine mode. Sending mail, composer attachments, and updates across Spark versions are unverified.
 
 ## TL;DR
 
