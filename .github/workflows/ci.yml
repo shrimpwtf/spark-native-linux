@@ -14,7 +14,11 @@ jobs:
         run: pacman -Syu --noconfirm --needed git python python-gobject bubblewrap libnotify desktop-file-utils xdg-utils
       - uses: actions/checkout@v4
       - name: Unit tests
-        run: python -m unittest discover -s tests
+        # Root can write to read-only directories, which the launcher tests rely on.
+        run: |
+          useradd -m tester
+          chown -R tester .
+          su tester -c 'python -m unittest discover -s tests'
       - name: Shell syntax
         run: |
           for script in run-spark.sh install.sh install-handler.sh bin/*.sh packaging/*.sh packaging/bin/*; do
