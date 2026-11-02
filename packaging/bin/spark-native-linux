@@ -1,0 +1,17 @@
+#!/bin/sh
+root=/usr/share/spark-native-linux
+export SPARK_ROOT=$root
+export SPARK_STATE=${XDG_DATA_HOME:-$HOME/.local/share}/spark-native-linux
+export PATH=/usr/bin:$PATH
+
+mkdir -p "$SPARK_STATE"
+version=$(cat "$root/VERSION")
+if [ "$(cat "$SPARK_STATE/.host-filetypes" 2>/dev/null)" != "$version" ]; then
+  echo 'spark-native-linux: preparing the Wine prefix. The first run takes a minute.' >&2
+  if "$root/bin/register-host-filetypes.sh"; then
+    printf '%s\n' "$version" > "$SPARK_STATE/.host-filetypes"
+  else
+    echo 'spark-native-linux: could not register file types; continuing.' >&2
+  fi
+fi
+exec "$root/run-spark.sh" "$@"

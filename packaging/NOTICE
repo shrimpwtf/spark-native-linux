@@ -1,0 +1,8 @@
+spark-native-linux contains no Spark or Microsoft code.
+
+The Spark installer is downloaded from Readdle at build time and is covered by
+Readdle's own terms. This package is unofficial and has no affiliation with
+Readdle.
+
+The launcher, shims and helpers are MIT licensed, derived from spark-mail-linux
+by Kyryl Bogach with contributions from Pablo Pineda and Mert Demir. See LICENSE.

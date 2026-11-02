@@ -1,0 +1,73 @@
+# Maintainer: shrimpwtf <james@shrimp.wtf>
+# Spark's installer is downloaded from Readdle at build time. It is never stored
+# in this repository or in the AUR.
+pkgname=spark-native-linux
+pkgver=3.32.1.141358
+pkgrel=1
+pkgdesc='Spark Mail for Windows on Linux through Wine, with compatibility shims and desktop integration'
+arch=('x86_64')
+url='https://github.com/shrimpwtf/spark-native-linux'
+license=('MIT' 'LicenseRef-Readdle-Spark')
+depends=('wine' 'bubblewrap' 'python' 'python-gobject' 'libnotify' 'hicolor-icon-theme'
+         'xdg-utils' 'xorg-xprop' 'xdg-desktop-portal')
+makedepends=('clang' 'binutils' 'libarchive' 'icoutils' 'imagemagick')
+optdepends=('wl-clipboard: image paste bridge on Wayland')
+options=('!strip' '!debug' '!emptydirs')
+install=$pkgname.install
+_installer="Spark-$pkgver.exe"
+_src="$pkgname-$pkgver-$pkgrel"
+source=("$_src.tar.gz::$url/releases/download/v$pkgver-$pkgrel/$_src.tar.gz"
+        "$_installer::https://downloads.sparkmailapp.com/Spark3/win/dist/$pkgver/Spark.exe")
+noextract=("$_installer")
+sha256sums=('SKIP' '0193a2ac6fef5e848a69502d9605b39dad9ba99ed53af14e0c41b6223f928533')
+
+build() {
+  cd "$srcdir/$_src"
+  local stage="$srcdir/stage"
+  ./bin/extract-installer.sh "$srcdir/$_installer" "$stage/app"
+  OUT_DIR="$stage/app" ./shims/build.sh
+  SPARK_ROOT="$stage" python shims/patch-foundation.py
+  SPARK_ROOT="$stage" python shims/patch-iphlpapi.py
+
+  local foundation="$stage/app/resources/app.asar.unpacked/node_modules/@readdle/sparkcore-win/bin/Release/SparkCore.bundle/Foundation.dll"
+  objdump -p "$foundation" | grep -q 'sprkenv.dll'
+  objdump -p "$foundation" | grep -q 'sprkiphl.dll'
+  ! objdump -p "$foundation" | grep -qi 'USERENV.dll'
+
+  ./bin/build-wine-helpers.sh
+  ./bin/extract-icons.sh "$stage/app/Spark Desktop.exe" "$srcdir/icons/hicolor" "$pkgname"
+}
+
+package() {
+  cd "$srcdir/$_src"
+  local root="/usr/share/$pkgname"
+
+  install -d "$pkgdir$root"
+  cp -a "$srcdir/stage/app" "$pkgdir$root/app"
+  install -Dm755 run-spark.sh "$pkgdir$root/run-spark.sh"
+  cp -a bin share "$pkgdir$root/"
+  install -d "$pkgdir/usr/lib/$pkgname"
+  cp -a .build/. "$pkgdir/usr/lib/$pkgname/"
+  ln -s "/usr/lib/$pkgname" "$pkgdir$root/.build"
+  printf '%s\n' "$pkgver-$pkgrel" > "$pkgdir$root/VERSION"
+  chmod -R u+rwX,go+rX,go-w "$pkgdir$root"
+
+  install -Dm755 packaging/bin/spark-native-linux "$pkgdir/usr/bin/spark-native-linux"
+  install -Dm755 packaging/bin/spark-native-linux-auth "$pkgdir/usr/bin/spark-native-linux-auth"
+  install -Dm755 packaging/bin/spark-cli "$pkgdir/usr/bin/spark-cli"
+
+  sed -e 's|^Exec=.*|Exec=/usr/bin/spark-native-linux|' \
+      -e '/^Path=/d' \
+      -e "s|^Icon=.*|Icon=$pkgname|" \
+      share/spark-mail-linux.desktop.in |
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/$pkgname.desktop"
+  sed -e 's|^Exec=.*|Exec=/usr/bin/spark-native-linux-auth %u|' \
+      share/spark-mail-linux-auth.desktop.in |
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/$pkgname-auth.desktop"
+
+  install -d "$pkgdir/usr/share/icons"
+  cp -a "$srcdir/icons/hicolor" "$pkgdir/usr/share/icons/"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 packaging/NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+}

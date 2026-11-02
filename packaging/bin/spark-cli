@@ -1,0 +1,5 @@
+#!/bin/sh
+export SPARK_ROOT=/usr/share/spark-native-linux
+export SPARK_STATE=${XDG_DATA_HOME:-$HOME/.local/share}/spark-native-linux
+export PATH=/usr/bin:$PATH
+exec "$SPARK_ROOT/bin/spark" "$@"

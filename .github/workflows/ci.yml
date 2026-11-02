@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed git python python-gobject bubblewrap libnotify desktop-file-utils xdg-utils
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: python -m unittest discover -s tests
+      - name: Shell syntax
+        run: |
+          for script in run-spark.sh install.sh install-handler.sh bin/*.sh packaging/*.sh packaging/bin/*; do
+            bash -n "$script"
+          done
+
+  package:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the package in a clean Arch container and check it
+        run: ./packaging/test-build.sh

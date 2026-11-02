@@ -48,20 +48,7 @@ if [ -n "$missing" ]; then
   exit 1
 fi
 
-# --- Validate the installer --------------------------------------------------
-
-# A Windows installer starts with the MZ header. bsdtar rejects anything it
-# cannot list, so a bad file fails here and not after a half-empty app/.
-if [ "$(head -c 2 "$installer")" != "MZ" ]; then
-  echo "error: $installer is not a Windows executable." >&2
-  exit 1
-fi
-if ! bsdtar -tf "$installer" >/dev/null 2>&1; then
-  echo "error: bsdtar cannot read $installer as an NSIS archive." >&2
-  exit 1
-fi
-
-# --- Extract -----------------------------------------------------------------
+# --- Extract and verify ------------------------------------------------------
 
 # Refuse to overwrite an existing install. Account state lives outside app/,
 # so a repair can safely delete it. Updates follow the procedure in AGENTS.md.
@@ -72,57 +59,7 @@ if [ -e "$app/Spark Desktop.exe" ]; then
   exit 1
 fi
 
-mkdir -p "$app"
-bsdtar -xf "$installer" -C "$app"
-
-# --- Verify extraction completeness ------------------------------------------
-
-# libarchive can stop silently partway through an NSIS archive. The failure
-# then surfaces later as 'Error loading V8 startup snapshot file' or
-# 'Cannot find module @readdle/sparkcore-win'. Compare the archive manifest
-# against the extracted tree and recover missing entries once with -T.
-manifest=$(mktemp)
-missing_list=$(mktemp)
-trap 'rm -f "$manifest" "$missing_list"' EXIT
-
-bsdtar -tf "$installer" > "$manifest"
-
-find_missing() {
-  : > "$missing_list"
-  local entry norm
-  while IFS= read -r entry; do
-    # Normalize separators and leading ./ so both sides compare equal.
-    norm=${entry//\\//}
-    norm=${norm#./}
-    norm=${norm%/}
-    [ -z "$norm" ] && continue
-    [ -e "$app/$norm" ] || printf '%s\n' "$entry" >> "$missing_list"
-  done < "$manifest"
-}
-
-find_missing
-if [ -s "$missing_list" ]; then
-  count=$(wc -l < "$missing_list")
-  echo "warning: extraction missed $count entries. Recovering them now." >&2
-  bsdtar -xf "$installer" -C "$app" -T "$missing_list"
-  find_missing
-fi
-if [ -s "$missing_list" ]; then
-  echo "error: extraction is still incomplete after one recovery pass." >&2
-  echo "The first missing entries:" >&2
-  head -5 "$missing_list" >&2
-  exit 1
-fi
-
-for required in \
-  "Spark Desktop.exe" \
-  "resources.pak" \
-  "snapshot_blob.bin" \
-  "v8_context_snapshot.bin" \
-  "resources/app.asar.unpacked/node_modules/@readdle/sparkcore-win/package.json"
-do
-  [ -e "$app/$required" ] || { echo "error: missing required file: app/$required" >&2; exit 1; }
-done
+"$root/bin/extract-installer.sh" "$installer" "$app"
 
 # --- Build, patch, register --------------------------------------------------
 

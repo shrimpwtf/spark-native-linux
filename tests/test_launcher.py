@@ -407,6 +407,75 @@ class LauncherTests(unittest.TestCase):
 
             self.assertEqual(tray_state.read_text(), 'stopped')
 
+    def test_creates_the_wine_prefix_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.make_root(temporary)
+            environment = dict(os.environ, SPARK_ROOT=str(root), SPARK_CONTAINER='0',
+                               SPARK_NOTIFY='0', SPARK_CLOSE_TRAY='0', SPARK_WINE='/bin/true')
+            subprocess.run([ROOT / 'run-spark.sh'], env=environment,
+                           check=True, capture_output=True)
+            self.assertTrue((root / 'prefix').is_dir())
+
+    def test_state_directory_keeps_a_read_only_code_root_untouched(self):
+        with tempfile.TemporaryDirectory() as code, tempfile.TemporaryDirectory() as state, \
+                tempfile.TemporaryDirectory() as tools:
+            root = self.make_root(code).resolve()
+            state = Path(state).resolve() / 'not' / 'created' / 'yet'
+            tools = Path(tools)
+            fake_wine = tools / 'fake-wine'
+            fake_wine.write_text('#!/bin/sh\nprintf "%s" "$WINEPREFIX" > "$RESULT_FILE"\n')
+            fake_wine.chmod(0o755)
+            result_file = tools / 'wineprefix'
+            before = sorted(os.listdir(root))
+            environment = dict(os.environ, SPARK_ROOT=str(root), SPARK_STATE=str(state),
+                               SPARK_CONTAINER='0', SPARK_NOTIFY='0', SPARK_CLOSE_TRAY='0',
+                               SPARK_WINE=str(fake_wine), RESULT_FILE=str(result_file))
+            os.chmod(root, 0o555)
+            try:
+                subprocess.run([ROOT / 'run-spark.sh'], env=environment,
+                               check=True, capture_output=True)
+                self.assertEqual(sorted(os.listdir(root)), before)
+            finally:
+                os.chmod(root, 0o755)
+            self.assertEqual(result_file.read_text(), str(state / 'prefix'))
+            for name in ('prefix', 'tmp', 'test-home'):
+                self.assertTrue((state / name).is_dir(), name)
+
+    def test_container_binds_state_and_mounts_a_read_only_code_root_read_only(self):
+        with tempfile.TemporaryDirectory() as code, tempfile.TemporaryDirectory() as state, \
+                tempfile.TemporaryDirectory() as tools:
+            root = self.make_root(code).resolve()
+            state = Path(state).resolve()
+            tools = Path(tools)
+            bwrap = tools / 'bwrap'
+            bwrap.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$BWRAP_ARGUMENTS"\n')
+            bwrap.chmod(0o755)
+            arguments = tools / 'arguments'
+            environment = dict(os.environ, SPARK_ROOT=str(root), SPARK_STATE=str(state),
+                               SPARK_NOTIFY='0', SPARK_CLOSE_TRAY='0', SPARK_WINE='/bin/true',
+                               BWRAP_ARGUMENTS=str(arguments),
+                               PATH=f'{tools}:{os.environ["PATH"]}')
+            os.chmod(root, 0o555)
+            os.chmod(root / 'app', 0o555)
+            try:
+                subprocess.run([ROOT / 'run-spark.sh'], env=environment,
+                               check=True, capture_output=True)
+            finally:
+                os.chmod(root / 'app', 0o755)
+                os.chmod(root, 0o755)
+            values = arguments.read_text().splitlines()
+
+            def has(*sequence):
+                size = len(sequence)
+                return any(values[i:i + size] == list(sequence) for i in range(len(values)))
+
+            self.assertTrue(has('--bind', str(state / 'test-home'), os.environ['HOME']))
+            self.assertTrue(has('--bind', str(state), str(state)))
+            self.assertTrue(has('--bind', str(state / 'prefix'), str(state / 'prefix')))
+            self.assertTrue(has('--ro-bind', str(root), str(root)))
+            self.assertTrue(has('--ro-bind', str(root / 'app'), str(root / 'app')))
+            self.assertEqual(values[values.index('SPARK_STATE') + 1], str(state))
+
 
 if __name__ == '__main__':
     unittest.main()

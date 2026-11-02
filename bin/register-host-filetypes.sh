@@ -18,8 +18,9 @@ wine_tool() {
     "$root/run-spark.sh" "$@"
 }
 
-mkdir -p "$root/tmp"
-stage=$(mktemp -d "$root/tmp/host-filetypes.XXXXXXXX")
+state=${SPARK_STATE:-$root}
+mkdir -p "$state/tmp"
+stage=$(mktemp -d "$state/tmp/host-filetypes.XXXXXXXX")
 trap 'rm -rf "$stage"' EXIT
 registry_file=$stage/fallback.reg
 existing=$stage/existing.reg

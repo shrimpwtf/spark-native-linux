@@ -44,7 +44,7 @@ def host_path(path, environ):
     """Map a container path to the host path the launcher mounted there."""
     path = os.path.realpath(path)
     home = environ.get('HOME', '').rstrip('/')
-    mounts = [(environ[key], environ[key]) for key in ('SPARK_ROOT', 'WINEPREFIX', 'SPARK_APP')
+    mounts = [(environ[key], environ[key]) for key in ('SPARK_ROOT', 'SPARK_STATE', 'WINEPREFIX', 'SPARK_APP')
               if environ.get(key)]
     if environ.get('SPARK_CONTAINER_TMP'):
         mounts.append(('/tmp', environ['SPARK_CONTAINER_TMP']))

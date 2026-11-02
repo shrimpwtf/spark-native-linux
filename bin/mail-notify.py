@@ -20,9 +20,10 @@ import time
 
 ROOT = os.environ.get('SPARK_ROOT') or os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))
-PREFIX = os.environ.get('SPARK_PREFIX') or os.path.join(ROOT, 'prefix')
-STATE = os.path.join(ROOT, 'mail-notify.state')
-LOCK = os.path.join(ROOT, 'mail-notify.lock')
+STATE_DIR = os.environ.get('SPARK_STATE') or ROOT
+PREFIX = os.environ.get('SPARK_PREFIX') or os.path.join(STATE_DIR, 'prefix')
+STATE = os.path.join(STATE_DIR, 'mail-notify.state')
+LOCK = os.path.join(STATE_DIR, 'mail-notify.lock')
 POLL_SECONDS = int(os.environ.get('SPARK_POLL_SECONDS', '15'))
 
 # Spark stores the database under the Wine user's AppData. The prefix user name

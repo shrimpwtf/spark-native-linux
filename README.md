@@ -10,13 +10,31 @@ Run [Spark Mail](https://sparkmailapp.com/) for Windows on Linux with Wine.
 Two small DLL shims prevent known crashes. Scripts handle launch, browser login, and native notifications.
 
 - **Unofficial.** Readdle does not support this project.
-- **Verified:** Spark 3.31.6.141244 starts on Arch Linux with Wine 11.16.
+- **Verified:** Spark 3.32.1.141358 builds as a package, installs, and starts in a clean Arch container under a virtual display. Spark 3.31.6.141244 started on a real Arch desktop with Wine 11.16.
 - **CLI:** The bundled Windows CLI works through [bin/spark](bin/spark). Spark Desktop must remain open.
-- **Updates:** Follow the [update procedure](AGENTS.md#update-spark), not Spark’s update button.
+- **Updates:** Package installs update through the AUR. Repository installs follow the [update procedure](AGENTS.md#update-spark). Never use Spark’s update button.
 
 <img src="docs/screenshots/spark-desktop.png" alt="Spark Desktop on Linux with an empty inbox" width="640">
 
 ## Install
+
+### Arch Linux package
+
+The package downloads Spark from Readdle when it builds, so this project distributes no Readdle file.
+
+```bash
+yay -S spark-native-linux
+spark-native-linux
+```
+
+Spark's data lives in `~/.local/share/spark-native-linux`. `spark-cli` runs the bundled Spark CLI.
+The package is not on the AUR until the maintainer publishes it. Until then, use the repository install below.
+
+A new Spark release arrives as a package update. Before the update is published, an automated run checks that the shims patch the new
+`Foundation.dll`, that the package builds and installs in a clean Arch container, and that the desktop starts under a virtual display.
+When a check fails, nothing is published, the package stays on the last good version, and an issue is opened.
+
+### From a repository checkout
 
 See [INSTALLATION.md](INSTALLATION.md) for full instructions, verification steps, caveats, and troubleshooting.
 The recommended way to install is to give this repository to a coding agent. The installation document is written for that.

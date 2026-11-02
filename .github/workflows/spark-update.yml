@@ -1,0 +1,156 @@
+name: Spark update
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Spark version to package. Leave empty for the newest release.
+        required: false
+      rebuild:
+        description: Repackage the current Spark version with a new pkgrel after a code fix.
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: spark-update
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.latest.outputs.version }}
+      pkgrel: ${{ steps.latest.outputs.pkgrel }}
+      update: ${{ steps.latest.outputs.update }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: latest
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REBUILD: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)
+          current_rel=$(sed -n 's/^pkgrel=//p' packaging/PKGBUILD)
+          if [ -n "$INPUT_VERSION" ]; then
+            version=$INPUT_VERSION
+          elif [ "$INPUT_REBUILD" = true ]; then
+            version=$current
+          else
+            read -r version _ < <(python3 packaging/latest_spark.py)
+          fi
+          [[ $version =~ ^[0-9]+(\.[0-9]+){3}$ ]] || { echo "unexpected version: $version" >&2; exit 1; }
+          pkgrel=1
+          update=false
+          if [ "$INPUT_REBUILD" = true ] && [ "$version" = "$current" ]; then
+            pkgrel=$((current_rel + 1))
+            update=true
+          elif [ "$version" != "$current" ]; then
+            update=true
+          fi
+          {
+            echo "version=$version"
+            echo "pkgrel=$pkgrel"
+            echo "update=$update"
+          } >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: detect
+    if: needs.detect.outputs.update == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      PKGREL: ${{ needs.detect.outputs.pkgrel }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download the installer from Readdle
+        run: curl -fL --retry 3 -o "$RUNNER_TEMP/Spark.exe" "https://downloads.sparkmailapp.com/Spark3/win/dist/$VERSION/Spark.exe"
+      - name: Pin the installer checksum
+        run: ./packaging/bump.sh "$VERSION" "$RUNNER_TEMP/Spark.exe" "$PKGREL"
+      - name: Build, install and smoke-test in a clean Arch container
+        run: |
+          set -o pipefail
+          ./packaging/test-build.sh "$RUNNER_TEMP/Spark.exe" 2>&1 | tee "$RUNNER_TEMP/verify.log"
+      - name: Open an issue when verification fails
+        if: failure()
+        run: |
+          title="Spark $VERSION failed verification"
+          if [ -z "$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[].number')" ]; then
+            fence=$(printf '\140\140\140')
+            body=$(printf 'Automatic verification of Spark %s failed. Nothing was published.\n\nLast lines of the log:\n\n%s\n%s\n%s\n' "$VERSION" "$fence" "$(tail -n 60 "$RUNNER_TEMP/verify.log" 2>/dev/null)" "$fence")
+            gh issue create --title "$title" --body "$body"
+          fi
+      - name: Commit, tag and release
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add packaging/PKGBUILD
+          git commit -m "Update Spark to $VERSION-$PKGREL"
+          tag="v$VERSION-$PKGREL"
+          name="spark-native-linux-$VERSION-$PKGREL"
+          git tag "$tag"
+          git archive --format=tar.gz --prefix="$name/" -o "$RUNNER_TEMP/$name.tar.gz" "$tag"
+          git push origin HEAD:main "$tag"
+          gh release create "$tag" "$RUNNER_TEMP/$name.tar.gz" \
+            --title "Spark $VERSION" \
+            --notes "Packaging for Spark $VERSION. Verified: patches apply, the package builds and installs in a clean Arch container, and the desktop starts under Xvfb."
+          sum=$(sha256sum "$RUNNER_TEMP/$name.tar.gz" | cut -d' ' -f1)
+          mkdir aur
+          sed "s/^sha256sums=('SKIP'/sha256sums=('$sum'/" packaging/PKGBUILD > aur/PKGBUILD
+          cp packaging/spark-native-linux.install aur/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aur-files
+          path: aur/
+
+  publish:
+    needs: [detect, verify]
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+      VERSION: ${{ needs.detect.outputs.version }}
+      PKGREL: ${{ needs.detect.outputs.pkgrel }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aur-files
+          path: aur
+      - name: Skip when no AUR key is configured
+        id: key
+        run: |
+          if [ -n "$AUR_SSH_PRIVATE_KEY" ]; then echo present=true >> "$GITHUB_OUTPUT"; else echo 'AUR_SSH_PRIVATE_KEY is not set; not publishing.'; fi
+      - name: Publish to the AUR
+        if: steps.key.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed base-devel git openssh
+          useradd -m builder
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org > ~/.ssh/known_hosts
+          ssh-keygen -lf ~/.ssh/known_hosts | grep -q 'SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4' ||
+            { echo 'AUR host key does not match the published fingerprint.' >&2; exit 1; }
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          git clone ssh://aur@aur.archlinux.org/spark-native-linux.git repo
+          cp aur/PKGBUILD aur/spark-native-linux.install repo/
+          chown -R builder repo
+          su builder -c 'cd repo && makepkg --printsrcinfo > .SRCINFO'
+          cd repo
+          git config user.name 'spark-native-linux bot'
+          git config user.email 'james@shrimp.wtf'
+          git add PKGBUILD .SRCINFO spark-native-linux.install
+          git diff --cached --quiet && { echo 'AUR is already up to date.'; exit 0; }
+          git commit -m "Update to $VERSION-$PKGREL"
+          git push origin HEAD:master

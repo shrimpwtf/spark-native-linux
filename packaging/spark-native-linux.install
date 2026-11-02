@@ -1,0 +1,13 @@
+post_install() {
+  echo '==> Start Spark from your application menu or with: spark-native-linux'
+  echo '==> State lives in ~/.local/share/spark-native-linux. Spark updates arrive as package updates.'
+  echo '==> Do not use the update button inside Spark.'
+}
+
+post_upgrade() {
+  post_install
+}
+
+post_remove() {
+  echo '==> Your data in ~/.local/share/spark-native-linux was kept. Delete it to remove the account state.'
+}

@@ -10,7 +10,9 @@
 # Environment overrides:
 #   SPARK_ROOT       project directory (default: this script's directory)
 #   SPARK_APP        application directory (default: SPARK_ROOT/app)
-#   SPARK_PREFIX     Wine prefix (default: SPARK_ROOT/prefix)
+#   SPARK_STATE      per-user state: prefix, home overlay, tmp, local config
+#                    (default: SPARK_ROOT; packaged installs use the XDG data directory)
+#   SPARK_PREFIX     Wine prefix (default: SPARK_STATE/prefix)
 #   SPARK_WINE       wine binary (default: bundled runtime, else wine in PATH)
 #   SPARK_DEBUG      WINEDEBUG value
 #   SPARK_OVERRIDES  WINEDLLOVERRIDES value
@@ -22,16 +24,26 @@
 set -euo pipefail
 
 root=${SPARK_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
-config=${SPARK_CONFIG:-$root/spark.local.env}
+mkdir -p "${SPARK_STATE:-$root}"
+state=$(readlink -f "${SPARK_STATE:-$root}")
+config=${SPARK_CONFIG:-$state/spark.local.env}
 if [ -f "$config" ]; then
   # This optional file is local, ignored by Git, and trusted like the launcher.
   # shellcheck source=/dev/null
   source "$config"
 fi
 app=$(readlink -f "${SPARK_APP:-$root/app}")
-prefix=$(readlink -f "${SPARK_PREFIX:-$root/prefix}")
-home_overlay=$root/test-home
-tmp_dir=$root/tmp
+prefix=$(readlink -f "${SPARK_PREFIX:-$state/prefix}")
+home_overlay=$state/test-home
+tmp_dir=$state/tmp
+
+# A packaged code root is not writable, so bind it read-only inside the container.
+root_bind=(--bind "$root" "$root")
+[ -w "$root" ] || root_bind=(--ro-bind "$root" "$root")
+app_bind=(--bind "$app" "$app")
+[ -w "$app" ] || app_bind=(--ro-bind "$app" "$app")
+state_bind=()
+[ "$state" = "$root" ] || state_bind=(--bind "$state" "$state")
 
 wine=${SPARK_WINE:-}
 if [ -z "$wine" ]; then
@@ -82,7 +94,7 @@ if [ -f "$foundation" ]; then
   fi
 fi
 
-mkdir -p "$tmp_dir" "$home_overlay"
+mkdir -p "$tmp_dir" "$home_overlay" "$prefix"
 
 # GNOME Shell starts applications with stdout and stderr connected to the
 # journal through a socket. Under Wine, Electron fails with "open EBADF"
@@ -155,7 +167,7 @@ cleanup() {
 }
 trap cleanup EXIT
 if [ "${SPARK_NOTIFY:-1}" != 0 ] && { [ -x "$root/bin/mail-notify.py" ] || [ -f "$root/bin/mail-notify.py" ]; }; then
-  SPARK_ROOT=$root SPARK_PREFIX=$prefix python3 "$root/bin/mail-notify.py" &
+  SPARK_ROOT=$root SPARK_STATE=$state SPARK_PREFIX=$prefix python3 "$root/bin/mail-notify.py" &
   watcher=$!
 fi
 
@@ -187,7 +199,7 @@ fi
 if [ "${SPARK_CONTAINER:-1}" = 0 ]; then
   (
     cd "$app"
-    export SPARK_ROOT=$root WINEPREFIX=$prefix WINEDLLOVERRIDES=$overrides WINEDEBUG=$debug PATH=$wine_path
+    export SPARK_ROOT=$root SPARK_STATE=$state WINEPREFIX=$prefix WINEDLLOVERRIDES=$overrides WINEDEBUG=$debug PATH=$wine_path
     "$wine" "$exe" "$@"
   ) || status=$?
 else
@@ -197,13 +209,15 @@ else
     --proc /proc \
     --bind "$home_overlay" "$HOME" \
     "${downloads_bind[@]}" \
-    --bind "$root" "$root" \
+    "${root_bind[@]}" \
+    "${state_bind[@]}" \
     --bind "$prefix" "$prefix" \
-    --bind "$app" "$app" \
+    "${app_bind[@]}" \
     --bind "$tmp_dir" /tmp \
     --ro-bind /tmp/.X11-unix /tmp/.X11-unix \
     --setenv WINEPREFIX "$prefix" \
     --setenv SPARK_ROOT "$root" \
+    --setenv SPARK_STATE "$state" \
     --setenv SPARK_APP "$app" \
     --setenv SPARK_CONTAINER_HOME "$home_overlay" \
     --setenv SPARK_CONTAINER_TMP "$tmp_dir" \

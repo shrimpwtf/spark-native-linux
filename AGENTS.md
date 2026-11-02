@@ -23,6 +23,10 @@ Docker does not replace the host display, Wine prefix, or desktop integration in
 | `bin/auth-callback.py` | Validates Spark URL schemes and forwards them through the launcher. |
 | `bin/mail-notify.py` | Reads Spark's database and emits native notifications. |
 | `bin/spark` | Runs the bundled Windows CLI through the desktop launcher. |
+| `bin/extract-installer.sh` | Extracts Spark's NSIS installer and checks that the extraction is complete. `install.sh` and the PKGBUILD both use it. |
+| `bin/extract-icons.sh` | Extracts Spark's icon from the executable into an icon theme. |
+| `packaging/` | The PKGBUILD, wrappers, install hook, version detector, `bump.sh`, and the container build check. |
+| `.github/workflows/` | CI, and the Spark update pipeline that publishes verified AUR updates. |
 | `install-handler.sh` | Registers the app launcher and URL handler with the host desktop. |
 | `bin/host-tools/xdg-open` | Wine's `xdg-open`: sends links and files to the host portal helpers. |
 | `bin/open-host-url.py` | Opens a web link through the portal's `OpenURI` method. |
@@ -89,7 +93,18 @@ For Kimi Code, that destination is `~/.kimi-code/skills/use-spark/SKILL.md`.
 
 Preserve any existing host skill before replacement. Keep generated skills and personal tool configuration out of this repository.
 
+## State directory
+
+`SPARK_ROOT` holds code. `SPARK_STATE` holds per-user state: the Wine prefix, the home overlay, `tmp/`, and `spark.local.env`.
+It defaults to `SPARK_ROOT`, so repository checkouts behave as before.
+The packaged wrappers set it to `~/.local/share/spark-native-linux` and install the code read-only under `/usr/share/spark-native-linux`.
+Never write under `SPARK_ROOT` at run time. The launcher creates the prefix itself.
+
 ## Update Spark
+
+This procedure is for repository checkouts. A package install updates through the package manager.
+The `Spark update` workflow publishes a package update only after the patches apply, the package builds in a clean Arch container,
+and the desktop starts under Xvfb. Use `packaging/bump.sh` and `packaging/test-build.sh` to reproduce a failed run locally.
 
 Treat a request to update Spark as permission to prepare, back up, replace, and restart this local installation.
 Explain the restart before you stop the application.
