@@ -2,7 +2,7 @@
 # Spark's installer is downloaded from Readdle at build time. It is never stored
 # in this repository or in the AUR.
 pkgname=spark-native-linux
-pkgver=3.33.0.141673
+pkgver=3.33.0.141685
 pkgrel=1
 pkgdesc='Spark Mail for Windows on Linux through Wine, with compatibility shims and desktop integration'
 arch=('x86_64')
@@ -19,7 +19,7 @@ _src="$pkgname-$pkgver-$pkgrel"
 source=("$_src.tar.gz::$url/releases/download/v$pkgver-$pkgrel/$_src.tar.gz"
         "$_installer::https://downloads.sparkmailapp.com/Spark3/win/dist/$pkgver/Spark.exe")
 noextract=("$_installer")
-sha256sums=('SKIP' '9395f0af7e7b017834e0eb4c8431155c2b92bb0b2db842f7cd0d42866f5a3b0a')
+sha256sums=('SKIP' 'cf104c461c39d29a9ef356b9f0b5640b8901dd1c068f176a069cfea85bd4bc74')
 
 build() {
   cd "$srcdir/$_src"
